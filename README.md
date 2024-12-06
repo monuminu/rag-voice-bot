@@ -53,6 +53,24 @@ The following files are also included in the repository:
 
         AZURE_OPENAI_CHAT_DEPLOYMENT_VERSION=2024-10-01-preview
         #You don't need to change this unless you are willing to try other versions.
+
+        AZURE_SEARCH_ENDPOINT=your_azure_search_endpoint
+        # replace with your Azure Search Endpoint
+
+        AZURE_SEARCH_KEY=your_azure_search_key
+        # replace with your Azure Search Key
+
+        INDEX_NAME=your_index_name
+        # replace with your index name
+
+        CHAINLIT_AUTH_SECRET=your_chainlit_auth_secret
+        # replace with your Chainlit auth secret create it using `chainlit create-secret`
+
+        AZURE_SPEECH_KEY=your_azure_speech_key
+        # replace with your Azure Speech Key
+
+        AZURE_SPEECH_REGION=your_azure_speech_region
+        # replace with your Azure Speech Region
     ```
 
 Once you have updated the .env file, please save the changes and you are ready to proceed to the next step.
