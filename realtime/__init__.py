@@ -18,9 +18,12 @@ from typing import Optional
 import platform
 from importlib.metadata import version
 from aiohttp import ClientSession, WSMsgType, WSServerHandshakeError, ClientTimeout
+from VAD.vad_iterator import VADIterator, int2float, float2int
 from azure.core.credentials import AzureKeyCredential
 from azure.core.credentials_async import AsyncTokenCredential
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+import torch
+vad_model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad")
 
 def float_to_16bit_pcm(float32_array):
     """
@@ -140,7 +143,6 @@ class RealtimeAPI(RealtimeEventHandler):
                         #"x-ms-client-request-id": str(self.request_id),
                         **auth_headers,
                     }
-                print(headers)
                 self.ws = await self._session.ws_connect(
                     "/openai/realtime",
                     headers=headers,
@@ -169,7 +171,7 @@ class RealtimeAPI(RealtimeEventHandler):
         async for message in self.ws:
             event = json.loads(message.data)
             if event['type'] == "error":
-                logger.error("ERROR", message)
+                logger.error("ERROR", event)
             self.log("received:", event)
             self.dispatch(f"server.{event['type']}", event)
             self.dispatch("server.*", event)
@@ -209,6 +211,7 @@ class RealtimeConversation:
         'conversation.item.input_audio_transcription.completed': lambda self, event: self._process_input_audio_transcription_completed(event),
         'input_audio_buffer.speech_started': lambda self, event: self._process_speech_started(event),
         'input_audio_buffer.speech_stopped': lambda self, event, input_audio_buffer: self._process_speech_stopped(event, input_audio_buffer),
+        'input_audio_buffer.committed': lambda self, event: self._process_input_audio_buffer_committed(event),
         'response.created': lambda self, event: self._process_response_created(event),
         'response.output_item.added': lambda self, event: self._process_output_item_added(event),
         'response.output_item.done': lambda self, event: self._process_output_item_done(event),
@@ -338,6 +341,9 @@ class RealtimeConversation:
             speech['audio'] = input_audio_buffer[start_index:end_index]
         return None, None
 
+    def _process_input_audio_buffer_committed(self, event):
+        print(event)
+    
     def _process_response_created(self, event):
         response = event['response']
         if response['id'] not in self.response_lookup:
@@ -424,6 +430,16 @@ class RealtimeClient(RealtimeEventHandler):
     def __init__(self, system_prompt: str, temperature = 0.8):
         super().__init__()
         self.system_prompt = system_prompt
+        self.custom_vad = False
+        if self.custom_vad:
+            self.default_server_vad_config = None
+        else:
+            self.default_server_vad_config = {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 200,
+            }
         self.default_session_config = {
             "modalities": ["text", "audio"],
             "instructions": self.system_prompt,
@@ -431,7 +447,7 @@ class RealtimeClient(RealtimeEventHandler):
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
             "input_audio_transcription": { "model": 'whisper-1'},
-            "turn_detection": { "type": 'server_vad' },
+            "turn_detection": self.default_server_vad_config,
             "tools": [],
             "tool_choice": "auto",
             "temperature": temperature,
@@ -439,16 +455,18 @@ class RealtimeClient(RealtimeEventHandler):
         }
         self.session_config = {}
         self.transcription_models = [{"model": "whisper-1"}]
-        self.default_server_vad_config = {
-            "type": "server_vad",
-            "threshold": 0.5,
-            "prefix_padding_ms": 300,
-            "silence_duration_ms": 200,
-        }
         self.realtime = RealtimeAPI()
         self.conversation = RealtimeConversation()
         self._reset_config()
         self._add_api_event_handlers()
+        self.vad_iterator = VADIterator(
+            vad_model,
+            threshold=0.7,
+            sampling_rate=16000,
+            min_silence_duration_ms=1000,
+            speech_pad_ms=200
+        )
+        
         
     def _reset_config(self):
         self.session_created = False
@@ -517,7 +535,6 @@ class RealtimeClient(RealtimeEventHandler):
 
     async def _call_tool(self, tool):
         try:
-            print(tool["arguments"])
             json_arguments = json.loads(tool["arguments"])
             tool_config = self.tools.get(tool["name"])
             if not tool_config:
@@ -572,7 +589,7 @@ class RealtimeClient(RealtimeEventHandler):
             await self.realtime.disconnect()
 
     def get_turn_detection_type(self):
-        return self.session_config.get("turn_detection", {}).get("type")
+        return self.session_config.get("turn_detection")
 
     async def add_tool(self, definition, handler):
         if not definition.get("name"):
@@ -631,12 +648,28 @@ class RealtimeClient(RealtimeEventHandler):
         await self.create_response()
         return True
 
-    async def append_input_audio(self, array_buffer):
+    async def append_input_audio(self, array_buffer):        
         if len(array_buffer) > 0:
-            await self.realtime.send("input_audio_buffer.append", {
-                "audio": array_buffer_to_base64(np.array(array_buffer)),
-            })
-            self.input_audio_buffer.extend(array_buffer)
+            if self.custom_vad:
+                for i in range(0, len(array_buffer), 1024):
+                    chunk = array_buffer[i:i+1024]
+                    chunk = np.frombuffer(chunk, dtype=np.int16)
+                    vad_output = self.vad_iterator(torch.from_numpy(int2float(chunk)))
+                    if vad_output is not None and vad_output == "INTERRUPT_TTS":
+                        self.dispatch("conversation.interrupted", None)
+                        continue
+                    if vad_output is not None and len(vad_output) != 0:
+                        array = np.concatenate(vad_output)
+                        await self.realtime.send("input_audio_buffer.append", {
+                            "audio": array_buffer_to_base64(array),
+                        })
+                        self.input_audio_buffer.extend(array)
+                        await self.create_response()
+            else:
+                await self.realtime.send("input_audio_buffer.append", {
+                            "audio": array_buffer_to_base64(np.array(array_buffer)),
+                        })
+                self.input_audio_buffer.extend(array_buffer)
         return True
 
     async def create_response(self):
